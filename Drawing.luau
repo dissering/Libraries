@@ -32,6 +32,68 @@ local Drawing = {
     }
 }
 
+-- BEGIN POLYGON RASTERIZER (pure geometry; exercised by tests/polygon_geometry.py)
+-- Emit disjoint integer rectangles using the even-odd rule at pixel centers.
+-- Points must follow the perimeter. Crossing quads use even-odd filling.
+local function rasterizePolygon(points, width, height, emit)
+    local minY, maxY = math.huge, -math.huge
+    for _, p in ipairs(points) do
+        -- Invalid coordinates must never become loop bounds or GUI dimensions.
+        if p.X ~= p.X or p.Y ~= p.Y
+            or math.abs(p.X) == math.huge or math.abs(p.Y) == math.huge then
+            return
+        end
+        minY = math.min(minY, p.Y)
+        maxY = math.max(maxY, p.Y)
+    end
+    local first = math.max(0, math.ceil(minY - 0.5))
+    local last = math.min(height - 1, math.ceil(maxY - 0.5) - 1)
+    local previous = {}
+    for y = first, last do
+        local sampleY = y + 0.5
+        local hits = {}
+        for i, a in ipairs(points) do
+            local b = points[i % #points + 1]
+            -- Half-open edges exclude horizontal edges and double-counted vertices.
+            if (a.Y <= sampleY and sampleY < b.Y)
+                or (b.Y <= sampleY and sampleY < a.Y) then
+                hits[#hits + 1] = a.X + (sampleY - a.Y) / (b.Y - a.Y) * (b.X - a.X)
+            end
+        end
+        table.sort(hits)
+        local current = {}
+        for i = 1, #hits - 1, 2 do
+            local left = math.max(0, math.ceil(hits[i] - 0.5))
+            local right = math.min(width, math.ceil(hits[i + 1] - 0.5))
+            if right > left then
+                local rect
+                for _, old in ipairs(previous) do
+                    if old.x == left and old.w == right - left then
+                        rect = old
+                        break
+                    end
+                end
+                if rect then
+                    rect.h = rect.h + 1
+                else
+                    rect = {x = left, y = y, w = right - left, h = 1}
+                end
+                current[#current + 1] = rect
+            end
+        end
+        for _, old in ipairs(previous) do
+            local continued = false
+            for _, rect in ipairs(current) do
+                if rect == old then continued = true break end
+            end
+            if not continued then emit(old.x, old.y, old.w, old.h) end
+        end
+        previous = current
+    end
+    for _, rect in ipairs(previous) do emit(rect.x, rect.y, rect.w, rect.h) end
+end
+-- END POLYGON RASTERIZER
+
 Drawing.new = function(drawingType)
     if type(drawingType) ~= "string" then
         error("Drawing.new: argument must be a string, got " .. type(drawingType), 2)
@@ -240,189 +302,109 @@ Drawing.new = function(drawingType)
             end
         end
         
-    elseif drawingType == "Triangle" then
-        drawingObj:Destroy()
-        
-        drawingObj = Instance.new("Frame")
-        drawingObj.BackgroundTransparency = 1
-        drawingObj.BorderSizePixel = 0
-        drawingObj.Size = UDim2.fromOffset(100, 100)
-        drawingObj.Parent = UI
-        
-        local point1Frame = Instance.new("Frame")
-        point1Frame.AnchorPoint = Vector2.new(0.5, 0.5)
-        point1Frame.BackgroundColor3 = Color3.new(1, 1, 1)
-        point1Frame.BorderSizePixel = 0
-        point1Frame.Parent = drawingObj
-        
-        local point2Frame = Instance.new("Frame")
-        point2Frame.AnchorPoint = Vector2.new(0.5, 0.5)
-        point2Frame.BackgroundColor3 = Color3.new(1, 1, 1)
-        point2Frame.BorderSizePixel = 0
-        point2Frame.Parent = drawingObj
-        
-        local point3Frame = Instance.new("Frame")
-        point3Frame.AnchorPoint = Vector2.new(0.5, 0.5)
-        point3Frame.BackgroundColor3 = Color3.new(1, 1, 1)
-        point3Frame.BorderSizePixel = 0
-        point3Frame.Parent = drawingObj
-        
+    elseif drawingType == "Triangle" or drawingType == "Quad" then
+        -- Keep the original root: DrawingCache and Remove retain the same instance.
+        drawingObj.Name = "Drawing" .. drawingType
+        drawingObj.ClipsDescendants = false
+        local count = drawingType == "Triangle" and 3 or 4
+        local keys = {"PointA", "PointB", "PointC", "PointD"}
         properties.PointA = Vector2.zero
-        properties.PointB = Vector2.new(50, 100)
-        properties.PointC = Vector2.new(100, 0)
+        properties.PointB = count == 3 and Vector2.new(50, 100) or Vector2.new(100, 0)
+        properties.PointC = count == 3 and Vector2.new(100, 0) or Vector2.new(100, 100)
+        if count == 4 then properties.PointD = Vector2.new(0, 100) end
         properties.Filled = false
         properties.Thickness = 1
-        
-        local updateTriangle = function()
+
+        local lines, spans = {}, {}
+        local activeSpans = 0
+        local dirty = true
+        local function newPart(name)
+            local frame = Instance.new("Frame")
+            frame.Name = name
+            frame.BorderSizePixel = 0
+            frame.BackgroundColor3 = properties.Color
+            frame.BackgroundTransparency = 1 - properties.Transparency
+            frame.ZIndex = properties.ZIndex
+            frame.Visible = false
+            frame.Parent = drawingObj
+            return frame
+        end
+        for i = 1, count do
+            lines[i] = newPart("Outline")
+            lines[i].AnchorPoint = Vector2.new(0.5, 0.5)
+        end
+        local function updatePolygon()
             if removed then return end
-            
-            local pA = properties.PointA
-            local pB = properties.PointB
-            local pC = properties.PointC
-            
-            local minX = math.min(pA.X, pB.X, pC.X)
-            local minY = math.min(pA.Y, pB.Y, pC.Y)
-            local maxX = math.max(pA.X, pB.X, pC.X)
-            local maxY = math.max(pA.Y, pB.Y, pC.Y)
-            
-            drawingObj.Position = UDim2.fromOffset(minX, minY)
-            drawingObj.Size = UDim2.fromOffset(maxX - minX, maxY - minY)
-            
-            local function drawLine(frame, p1, p2)
-                local dx = p2.X - p1.X
-                local dy = p2.Y - p1.Y
-                local length = math.sqrt(dx * dx + dy * dy)
-                
-                frame.Size = UDim2.fromOffset(length, properties.Thickness)
-                frame.Position = UDim2.fromOffset((p1.X + p2.X) / 2 - minX, (p1.Y + p2.Y) / 2 - minY)
-                frame.Rotation = math.deg(math.atan2(dy, dx))
-                frame.BackgroundColor3 = properties.Color
-                frame.BackgroundTransparency = 1 - properties.Transparency
+            -- The root must NEVER contribute a rectangular background.
+            drawingObj.BackgroundTransparency = 1
+            drawingObj.Visible = properties.Visible
+            local points = {}
+            for i = 1, count do points[i] = properties[keys[i]] end
+            for i, line in ipairs(lines) do
+                line.Visible = not properties.Filled
+                if not properties.Filled then
+                    local a, b = points[i], points[i % count + 1]
+                    local dx, dy = b.X - a.X, b.Y - a.Y
+                    line.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+                    line.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), properties.Thickness)
+                    line.Rotation = math.deg(math.atan2(dy, dx))
+                end
             end
-            
-            if properties.Filled then
-                point1Frame.Visible = false
-                point2Frame.Visible = false
-                point3Frame.Visible = false
-                drawingObj.BackgroundColor3 = properties.Color
-                drawingObj.BackgroundTransparency = 1 - properties.Transparency
-            else
-                point1Frame.Visible = true
-                point2Frame.Visible = true
-                point3Frame.Visible = true
-                drawingObj.BackgroundTransparency = 1
-                
-                drawLine(point1Frame, pA, pB)
-                drawLine(point2Frame, pB, pC)
-                drawLine(point3Frame, pC, pA)
+            if properties.Filled and properties.Visible and dirty then
+                local used = 0
+                local size = UI.AbsoluteSize
+                rasterizePolygon(points, math.floor(size.X), math.floor(size.Y), function(x, y, w, h)
+                    used = used + 1
+                    local span = spans[used]
+                    if not span then
+                        span = newPart("FillSpan")
+                        spans[used] = span
+                    end
+                    span.Position = UDim2.fromOffset(x, y)
+                    span.Size = UDim2.fromOffset(w, h)
+                end)
+                activeSpans = used
+                dirty = false
+            end
+            for i, span in ipairs(spans) do
+                span.Visible = properties.Filled and i <= activeSpans
+            end
+            for _, parts in ipairs({lines, spans}) do
+                for _, part in ipairs(parts) do
+                    part.BackgroundColor3 = properties.Color
+                    part.BackgroundTransparency = 1 - properties.Transparency
+                    part.ZIndex = properties.ZIndex
+                end
             end
         end
-        
         local oldNewindex = mt.__newindex
         mt.__newindex = function(t, k, v)
-            oldNewindex(t, k, v)
-            if k == "PointA" or k == "PointB" or k == "PointC" or k == "Filled" or k == "Thickness" or k == "Color" or k == "Transparency" then
-                updateTriangle()
-            end
-        end
-        
-    elseif drawingType == "Quad" then
-        drawingObj:Destroy()
-        
-        drawingObj = Instance.new("Frame")
-        drawingObj.BackgroundTransparency = 1
-        drawingObj.BorderSizePixel = 0
-        drawingObj.Size = UDim2.fromOffset(100, 100)
-        drawingObj.Parent = UI
-        
-        local line1 = Instance.new("Frame")
-        line1.AnchorPoint = Vector2.new(0.5, 0.5)
-        line1.BackgroundColor3 = Color3.new(1, 1, 1)
-        line1.BorderSizePixel = 0
-        line1.Parent = drawingObj
-        
-        local line2 = Instance.new("Frame")
-        line2.AnchorPoint = Vector2.new(0.5, 0.5)
-        line2.BackgroundColor3 = Color3.new(1, 1, 1)
-        line2.BorderSizePixel = 0
-        line2.Parent = drawingObj
-        
-        local line3 = Instance.new("Frame")
-        line3.AnchorPoint = Vector2.new(0.5, 0.5)
-        line3.BackgroundColor3 = Color3.new(1, 1, 1)
-        line3.BorderSizePixel = 0
-        line3.Parent = drawingObj
-        
-        local line4 = Instance.new("Frame")
-        line4.AnchorPoint = Vector2.new(0.5, 0.5)
-        line4.BackgroundColor3 = Color3.new(1, 1, 1)
-        line4.BorderSizePixel = 0
-        line4.Parent = drawingObj
-        
-        properties.PointA = Vector2.zero
-        properties.PointB = Vector2.new(100, 0)
-        properties.PointC = Vector2.new(100, 100)
-        properties.PointD = Vector2.new(0, 100)
-        properties.Filled = false
-        properties.Thickness = 1
-        
-        local updateQuad = function()
             if removed then return end
-            
-            local pA = properties.PointA
-            local pB = properties.PointB
-            local pC = properties.PointC
-            local pD = properties.PointD
-            
-            local minX = math.min(pA.X, pB.X, pC.X, pD.X)
-            local minY = math.min(pA.Y, pB.Y, pC.Y, pD.Y)
-            local maxX = math.max(pA.X, pB.X, pC.X, pD.X)
-            local maxY = math.max(pA.Y, pB.Y, pC.Y, pD.Y)
-            
-            drawingObj.Position = UDim2.fromOffset(minX, minY)
-            drawingObj.Size = UDim2.fromOffset(maxX - minX, maxY - minY)
-            
-            local function drawLine(frame, p1, p2)
-                local dx = p2.X - p1.X
-                local dy = p2.Y - p1.Y
-                local length = math.sqrt(dx * dx + dy * dy)
-                
-                frame.Size = UDim2.fromOffset(length, properties.Thickness)
-                frame.Position = UDim2.fromOffset((p1.X + p2.X) / 2 - minX, (p1.Y + p2.Y) / 2 - minY)
-                frame.Rotation = math.deg(math.atan2(dy, dx))
-                frame.BackgroundColor3 = properties.Color
-                frame.BackgroundTransparency = 1 - properties.Transparency
-            end
-            
-            if properties.Filled then
-                line1.Visible = false
-                line2.Visible = false
-                line3.Visible = false
-                line4.Visible = false
-                drawingObj.BackgroundColor3 = properties.Color
-                drawingObj.BackgroundTransparency = 1 - properties.Transparency
-            else
-                line1.Visible = true
-                line2.Visible = true
-                line3.Visible = true
-                line4.Visible = true
-                drawingObj.BackgroundTransparency = 1
-                
-                drawLine(line1, pA, pB)
-                drawLine(line2, pB, pC)
-                drawLine(line3, pC, pD)
-                drawLine(line4, pD, pA)
-            end
-        end
-        
-        local oldNewindex = mt.__newindex
-        mt.__newindex = function(t, k, v)
+            local previous = properties[k]
             oldNewindex(t, k, v)
-            if k == "PointA" or k == "PointB" or k == "PointC" or k == "PointD" or k == "Filled" or k == "Thickness" or k == "Color" or k == "Transparency" then
-                updateQuad()
+            drawingObj.BackgroundTransparency = 1
+            if k == "PointA" or k == "PointB" or k == "PointC"
+                or (count == 4 and k == "PointD") then
+                if previous ~= v then dirty = true end
+            elseif k ~= "Filled" and k ~= "Thickness" and k ~= "Color"
+                and k ~= "Transparency" and k ~= "Visible" and k ~= "ZIndex" then
+                return
             end
+            if previous ~= v then updatePolygon() end
         end
-        
+        local resizeConnection = UI:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            dirty = true
+            updatePolygon()
+        end)
+        local oldRemove = properties.Remove
+        properties.Remove = function()
+            if removed then return end
+            resizeConnection:Disconnect()
+            oldRemove()
+        end
+        properties.Destroy = properties.Remove
+        updatePolygon()
+
     elseif drawingType == "Text" then
         drawingObj:Destroy()
         
@@ -558,3 +540,4 @@ getgenv().setrenderproperty = function(obj, prop, value)
     end
     obj[prop] = value
 end
+
